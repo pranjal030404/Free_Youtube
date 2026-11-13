@@ -197,12 +197,10 @@ No state-management, routing, or dependency-injection packages are used beyond t
 │       └── PlaybackService.kt        # foreground service + MediaSession
 ├── test/                             # unit tests for filters, downloads, theme, UA
 ├── pubspec.yaml                      # dependencies and app version
-├── YTLite-mobile.apk                 # prebuilt phone APK (tracked)
-├── YTLite-tv.apk                     # prebuilt TV APK (tracked)
-└── YouTubeMusicBrowser.apk           # additional tracked APK (older build)
+└── .gitignore                        # *.apk is ignored; binaries ship via GitHub Releases
 ```
 
-The prebuilt APKs are committed binaries and may lag behind the source; rebuild to be sure.
+Prebuilt APKs are not stored in the repository. Download them from the [Releases page](https://github.com/pranjal030404/Free_Youtube/releases), or build from source below.
 
 ## Installation
 
@@ -215,6 +213,10 @@ The prebuilt APKs are committed binaries and may lag behind the source; rebuild 
 | JDK | 17 (source/target compatibility is set to Java 17) |
 | Android SDK | Platform and build tools compatible with AGP 8.13.0 |
 | Device / emulator | Android 7.0 (API 24) or newer with a system WebView |
+
+### Prebuilt APKs
+
+Download `YTLite-mobile.apk` (phone) or `YTLite-tv.apk` (Android TV) from the [Releases page](https://github.com/pranjal030404/Free_Youtube/releases) and install with `adb install -r <file>` or by opening the file on the device (allow installs from unknown sources).
 
 ### From source
 
@@ -324,7 +326,7 @@ The TV build has no download UI. See [Known limitations](#known-limitations) bef
 - **Downloads currently stop after about 1 MB.** The stream links obtained through `youtube_explode_dart` are refused (HTTP 403) or stall once a request goes past the first megabyte; YouTube now expects a proof-of-origin token that this client cannot supply. The menu row, quality sheet, progress bar and library are complete, but a full download does not finish on the tested device (OnePlus Nord, Android 12). Fixing this needs a supported way to obtain playable stream URLs and is not solved in this repository.
 - **Opus and 240p-and-below tracks are not offered**, because the same restriction applies to them.
 - **60 fps on TV** is dropped by the WebView on the tested TV (about a quarter of frames), so the TV build declines above 30 fps.
-- **Prebuilt APKs** are committed binaries and may lag the source.
+- **Prebuilt APKs** are published on [GitHub Releases](https://github.com/pranjal030404/Free_Youtube/releases) and may lag the source.
 - **Release signing** uses the debug key.
 
 ## Configuration

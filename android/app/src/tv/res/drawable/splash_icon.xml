@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Red play button shown while the app starts (same as the Flutter splash). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="84dp"
+    android:height="60dp"
+    android:viewportWidth="84"
+    android:viewportHeight="60">
+    <path
+        android:fillColor="#FF0033"
+        android:pathData="M16,0 H68 A16,16 0 0 1 84,16 V44 A16,16 0 0 1 68,60 H16 A16,16 0 0 1 0,44 V16 A16,16 0 0 1 16,0 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M34,18 L34,42 L54,30 Z" />
+</vector>

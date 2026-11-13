@@ -1,11 +1,17 @@
 import 'codec_filter.dart';
+import 'tv_display.dart';
 import 'tv_navigation.dart';
+import 'tv_player.dart';
+
+import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
 import '../download/downloader.dart';
+import 'mobile_page.dart';
 import '../settings/settings_store.dart';
 import '../settings/theme_pref.dart';
 import 'domain_filter.dart';
@@ -112,7 +118,12 @@ const String _tvAuthFocusScript = r"""
       const el = document.querySelector(
           'input[type="email"], input[name="identifier"], ' +
           'input[type="password"], input[name="Passwd"], input[name="password"]');
-      if (el && document.activeElement !== el) el.focus();
+      const active = document.activeElement;
+      const typing = active && (active.tagName === 'INPUT' ||
+          active.tagName === 'TEXTAREA' || active.isContentEditable);
+      // Focus the field for the first OK, but never steal focus back from a
+      // button the viewer has already navigated to with the D-pad.
+      if (el && !typing && active !== el) el.focus();
       if (tries > 20) clearInterval(t);
     }, 500);
   } catch (e) {}
@@ -136,11 +147,15 @@ class BrowserController extends ChangeNotifier {
   BrowserController({
     required this.settings,
     this.isTv = false,
+    this.hwVp9 = false,
     String initialUserAgent = UserAgents.fallback,
   }) : _userAgent = initialUserAgent;
 
   final SettingsStore settings;
   final bool isTv;
+
+  /// True when the device decodes VP9 in hardware (see codec_filter.dart).
+  final bool hwVp9;
   final DomainFilter domainFilter = const DomainFilter();
 
   InAppWebViewController? _web;
@@ -153,6 +168,16 @@ class BrowserController extends ChangeNotifier {
   /// The video on screen (watch / Shorts page), for the download button.
   final ValueNotifier<String?> videoId = ValueNotifier<String?>(null);
   final Downloader downloader = Downloader();
+
+  /// Video of the feed item whose menu was used (null = the open watch page).
+  String? menuVideoId;
+
+  /// Bumped when the page's own "Download" menu row is tapped.
+  final ValueNotifier<int> downloadRequest = ValueNotifier<int>(0);
+  final ValueNotifier<int> openDownloads = ValueNotifier<int>(0);
+
+  /// Whether the YouTube page is in dark mode (null until known).
+  final ValueNotifier<bool?> pageDark = ValueNotifier<bool?>(null);
 
   bool get isLoading => loadingNotifier.value;
   double get progress => progressNotifier.value;
@@ -178,6 +203,42 @@ class BrowserController extends ChangeNotifier {
   late bool _tvSite = isTv;
   String get _activeUserAgent =>
       _tvSite ? UserAgents.tvFrom(_userAgent) : _userAgent;
+
+  /// Switches the WebView user agent when the destination needs the other
+  /// interface (TV vs. mobile/auth). Called before every app-initiated load
+  /// and for navigations the override hook did not see (history, redirects).
+  Future<void> _useUserAgentFor(Uri? uri) async {
+    if (!isTv || uri == null) return;
+    final wantTv = domainFilter.wantsTvUserAgent(uri);
+    if (wantTv == _tvSite) return;
+    _tvSite = wantTv;
+    _invalidateSettings();
+    await _web?.setSettings(settings: buildSettings());
+  }
+
+  String? _lastUaFixUrl;
+  DateTime? _lastUaFixAt;
+
+  Future<void> _syncUserAgentOnLoad(Uri? url) async {
+    if (!isTv || url == null) return;
+    final scheme = url.scheme.toLowerCase();
+    if (scheme != 'https' && scheme != 'http') return;
+    final wantTv = domainFilter.wantsTvUserAgent(url);
+    if (wantTv == _tvSite) return;
+    final key = url.toString();
+    final now = DateTime.now();
+    if (_lastUaFixUrl == key &&
+        _lastUaFixAt != null &&
+        now.difference(_lastUaFixAt!) < const Duration(seconds: 3)) {
+      return;
+    }
+    _lastUaFixUrl = key;
+    _lastUaFixAt = now;
+    _tvSite = wantTv;
+    _invalidateSettings();
+    await _web?.setSettings(settings: buildSettings());
+    await _web?.loadUrl(urlRequest: URLRequest(url: WebUri(key)));
+  }
 
   /// Where "home" is: the TV interface on a TV, otherwise the mobile site.
   String get homeUrl => isTv ? DomainFilter.tvHome : DomainFilter.mobileHome;
@@ -272,6 +333,12 @@ class BrowserController extends ChangeNotifier {
     forMainFrameOnly: true,
   );
 
+  UserScript get mobilePageUserScript => UserScript(
+    source: mobilePageScript,
+    injectionTime: UserScriptInjectionTime.AT_DOCUMENT_END,
+    forMainFrameOnly: true,
+  );
+
   UserScript get adSkipUserScript => UserScript(
     source: ytAdSkipperScript,
     injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
@@ -285,7 +352,19 @@ class BrowserController extends ChangeNotifier {
   );
 
   UserScript get codecFilterUserScript => UserScript(
-    source: codecFilterScript,
+    source: codecFilterScript(hwVp9: hwVp9),
+    injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
+    forMainFrameOnly: true,
+  );
+
+  UserScript get tvDisplayUserScript => UserScript(
+    source: tvDisplayScript,
+    injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
+    forMainFrameOnly: true,
+  );
+
+  UserScript get tvPlayerUserScript => UserScript(
+    source: tvPlayerScript,
     injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
     forMainFrameOnly: true,
   );
@@ -297,10 +376,13 @@ class BrowserController extends ChangeNotifier {
   );
 
   List<UserScript> get userScripts => [
+    if (isTv) tvDisplayUserScript,
     if (isTv) codecFilterUserScript,
+    if (isTv) tvPlayerUserScript,
     // Background playback (and its once-per-3-s poll, notification and wake
     // lock) is a phone feature; a TV has no use for it.
     if (!isTv) playbackUserScript,
+    if (!isTv) mobilePageUserScript,
     if (adBlockingEnabled) adSkipUserScript,
     if (isTv) tvAuthFocusUserScript,
     if (isTv) tvNavUserScript,
@@ -311,6 +393,25 @@ class BrowserController extends ChangeNotifier {
     // On a TV the user agent only carries the Chrome version, which the
     // native fast path already supplied; skip the extra WebView round-trip.
     if (!isTv) _initUserAgent(c);
+    c.addJavaScriptHandler(
+      handlerName: 'ytlDownload',
+      callback: (args) {
+        final a = args.isNotEmpty && args.first is Map ? args.first as Map : {};
+        final id = a['id'];
+        menuVideoId = id is String && RegExp(r'^[\w-]{11}$').hasMatch(id) ? id : null;
+        downloadRequest.value++;
+      },
+    );
+    c.addJavaScriptHandler(
+      handlerName: 'ytlOpenDownloads',
+      callback: (_) => openDownloads.value++,
+    );
+    c.addJavaScriptHandler(
+      handlerName: 'ytlTheme',
+      callback: (args) {
+        pageDark.value = args.isNotEmpty && args.first == true;
+      },
+    );
     c.addJavaScriptHandler(
       handlerName: 'playback',
       callback: (args) async {
@@ -334,6 +435,17 @@ class BrowserController extends ChangeNotifier {
         } catch (_) {}
       },
     );
+    if (isTv) {
+      c.addJavaScriptHandler(
+        handlerName: 'pageReady',
+        callback: (_) => pageReady.value = true,
+      );
+      // The mic button next to YouTube's search box (see tv_player.dart).
+      c.addJavaScriptHandler(
+        handlerName: 'voiceSearch',
+        callback: (_) => unawaited(voiceSearch()),
+      );
+    }
     // Commands from the media session: watch, headset, lock screen, voice search.
     _playback.setMethodCallHandler((call) async {
       if (call.method != 'command') return;
@@ -366,6 +478,43 @@ class BrowserController extends ChangeNotifier {
 
   bool _autoplaySearch = false;
 
+  /// False until the first screen of YouTube is on screen (the splash covers
+  /// the page until then).
+  final ValueNotifier<bool> pageReady = ValueNotifier<bool>(false);
+
+
+  bool _listening = false;
+
+  /// Runs the TV's speech recogniser and types what was said into YouTube's
+  /// search box.
+  Future<void> voiceSearch() async {
+    final c = _web;
+    if (c == null || _listening) return;
+    _listening = true;
+    String? said;
+    try {
+      said = await _deviceChannel.invokeMethod<String>('recognizeSpeech');
+    } on PlatformException catch (e) {
+      blockedNotice = e.message ?? 'Voice search is not available';
+      notifyListeners();
+    } catch (_) {
+    } finally {
+      _listening = false;
+    }
+    await c.evaluateJavascript(
+      source:
+          'window.__ytmbVoiceResult && '
+          'window.__ytmbVoiceResult(${jsonEncode(said ?? '')});',
+    );
+  }
+
+  /// The remote's search / microphone key.
+  Future<void> onVoiceKey() async {
+    await _web?.evaluateJavascript(
+      source: 'window.__ytmbVoiceStart && window.__ytmbVoiceStart();',
+    );
+  }
+
   Future<void> _refreshNavState() async {
     final c = _web;
     if (c == null) return;
@@ -389,13 +538,11 @@ class BrowserController extends ChangeNotifier {
         policy == NavigationActionPolicy.ALLOW &&
         action.isForMainFrame != false &&
         uri != null) {
-      final wantTv = domainFilter.wantsTvUserAgent(uri);
-      if (wantTv != _tvSite) {
+      final wasTv = _tvSite;
+      await _useUserAgentFor(uri);
+      if (_tvSite != wasTv) {
         // The server picks the interface from the user agent, so switch it
         // first and then redo this navigation.
-        _tvSite = wantTv;
-        _invalidateSettings();
-        await _web?.setSettings(settings: buildSettings());
         await _web?.loadUrl(urlRequest: action.request);
         return NavigationActionPolicy.CANCEL;
       }
@@ -426,6 +573,9 @@ class BrowserController extends ChangeNotifier {
     final uri = action.request.url;
     if (uri == null || uri.toString() == 'about:blank') return false;
     if (decide(action) == NavigationActionPolicy.ALLOW) {
+      // The popup may cross from the TV interface to Google sign-in; give it
+      // the same user agent the top-level navigation would get.
+      await _useUserAgentFor(uri);
       await _web?.loadUrl(urlRequest: action.request);
     }
     return false;
@@ -447,6 +597,7 @@ class BrowserController extends ChangeNotifier {
     if (_triedDesktopUserAgent || url == null) return;
     _triedDesktopUserAgent = true;
     _userAgent = UserAgents.desktopFrom(_userAgent);
+    _tvSite = false;
     _invalidateSettings();
     await _web?.setSettings(settings: buildSettings());
     await _web?.loadUrl(urlRequest: URLRequest(url: WebUri(url.toString())));
@@ -454,6 +605,9 @@ class BrowserController extends ChangeNotifier {
 
   void onLoadStart(Uri? url) {
     _syncRemoteMode(url);
+    // Back/forward and server redirects bypass decideAsync; fix the user agent
+    // once if the page that is loading needs the other interface.
+    unawaited(_syncUserAgentOnLoad(url));
     loadingNotifier.value = true;
     progressNotifier.value = 0;
     final hadError = errorMessage != null;
@@ -565,6 +719,9 @@ class BrowserController extends ChangeNotifier {
     final hadError = errorMessage != null;
     errorMessage = null;
     if (hadError) notifyListeners();
+    // A toolbar/Settings action bypasses the override hook, so pick the right
+    // user agent here too (TV home vs. Music/Google sign-in).
+    await _useUserAgentFor(Uri.tryParse(url));
     await _web?.loadUrl(urlRequest: URLRequest(url: WebUri(url)));
   }
 
@@ -686,9 +843,13 @@ class BrowserController extends ChangeNotifier {
 
   @override
   void dispose() {
+    pageReady.dispose();
     progressNotifier.dispose();
     loadingNotifier.dispose();
     videoId.dispose();
+    downloadRequest.dispose();
+    openDownloads.dispose();
+    pageDark.dispose();
     super.dispose();
   }
 }

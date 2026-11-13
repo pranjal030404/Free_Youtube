@@ -20,7 +20,7 @@ A thin Flutter shell around `m.youtube.com`, `music.youtube.com`, and `youtube.c
 
 ---
 
-> **Project status:** early-stage (`0.1.0`), Android-only, and distributed as source plus prebuilt APKs. There is no CI pipeline, release keystore, or license file in the repository yet — see [Roadmap](#roadmap) and [License](#license).
+> **Project status:** early-stage (`0.1.0`), Android-only, and open source under the [MIT License](LICENSE), with prebuilt APKs on [GitHub Releases](https://github.com/pranjal030404/Free_Youtube/releases). Release builds are still signed with the debug key — see [Roadmap](#roadmap).
 
 ## Contents
 
@@ -39,6 +39,7 @@ A thin Flutter shell around `m.youtube.com`, `music.youtube.com`, and `youtube.c
 - [Roadmap](#roadmap)
 - [Contributing](#contributing)
 - [License](#license)
+- [Legal Notice](#legal-notice)
 - [Acknowledgements](#acknowledgements)
 
 ## Overview
@@ -416,15 +417,14 @@ No roadmap, milestone list, or issue labels are defined in this repository. `and
 
 The following are **suggestions only, not committed plans**:
 
-- Add a release keystore and `key.properties` configuration.
-- Add CI for `flutter analyze`, `flutter test`, and both flavored builds.
+- Add a release keystore and `key.properties` configuration (both are already git-ignored).
+- Extend the CI workflow (`.github/workflows/ci.yml`, analyze + test) to build both flavors.
 - Commit phone and TV screenshots (none are present today).
 - Restore full-length downloads once a supported way to obtain playable stream URLs is available (see Known limitations).
-- Add a `LICENSE` file before distributing the project publicly.
 
 ## Contributing
 
-There is no `CONTRIBUTING.md`, issue template, or CI workflow yet, so the workflow is:
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md). In short:
 
 1. Fork `https://github.com/pranjal030404/Free_Youtube` and create a topic branch.
 2. Make the change without altering unrelated files.
@@ -443,7 +443,13 @@ Style follows `flutter_lints` (`analysis_options.yaml`). Keep ad-skipping and TV
 
 ## License
 
-**No license file is present in this repository.** Without an explicit license, default copyright applies, so others do not automatically receive permission to use, modify, or redistribute the code. If you intend the project to be open source, add a `LICENSE` file (for example, via [choosealicense.com](https://choosealicense.com/)) and update this section.
+Released under the [MIT License](LICENSE). You are free to use, modify, and redistribute the code, including commercially, provided the copyright notice is kept.
+
+## Legal notice
+
+YT Lite is an **unofficial** client. It is not affiliated with, endorsed by, or sponsored by YouTube or Google; "YouTube" and "YouTube Music" are trademarks of Google LLC. The app embeds YouTube's own web pages and does not host or redistribute any content.
+
+Features such as ad skipping and downloading may conflict with YouTube's [Terms of Service](https://www.youtube.com/t/terms). You are responsible for how you use the app and for respecting the rights of content owners: download only content you are allowed to keep. The software is provided "as is", without warranty (see the license).
 
 ## Acknowledgements
 

@@ -30,10 +30,12 @@ const String tvNavigationScript = r'''
 
   var style = document.createElement('style');
   style.textContent =
-    '[data-ytmb-focus]{outline:4px solid #fff !important;' +
-    'outline-offset:2px !important;border-radius:6px;' +
-    'box-shadow:0 0 0 8px rgba(255,0,0,.85) !important;' +
-    'position:relative;z-index:2147483000;}';
+    // Draw the ring inside the element so card/row overflow clipping cannot
+    // hide it, and avoid position/z-index changes (they force layout on every
+    // focus move, which is noticeable on a 2 GB TV).
+    '[data-ytmb-focus]{outline:5px solid #fff !important;' +
+    'outline-offset:-5px !important;border-radius:6px;' +
+    'box-shadow:inset 0 0 0 12px rgba(255,0,0,.6) !important;}';
   (document.head || document.documentElement).appendChild(style);
 
   var current = null;
@@ -54,6 +56,80 @@ const String tvNavigationScript = r'''
     return ['button', 'checkbox', 'radio', 'submit', 'reset', 'range',
       'image', 'file', 'color'].indexOf(t) < 0;
   }
+
+  // Focusable by our rules? Used so a dialog/container taking focus does not
+  // become the highlighted item (the D-pad should land on its buttons).
+  function looksInteractive(el) {
+    if (!el || !el.tagName) return false;
+    var tag = el.tagName;
+    if (tag === 'A' || tag === 'BUTTON' || tag === 'INPUT' || tag === 'SELECT' ||
+        tag === 'TEXTAREA' || tag === 'SUMMARY') return true;
+    if (el.hasAttribute('tabindex') && el.getAttribute('tabindex') !== '-1') {
+      return true;
+    }
+    var role = el.getAttribute('role');
+    if (role && role !== 'dialog' && role !== 'presentation' && role !== 'none') {
+      return true;
+    }
+    var cls = typeof el.className === 'string' ? el.className : '';
+    return /button|entry-point|search-box|search-bar/.test(cls);
+  }
+
+  function activeModal() {
+    var nodes = document.querySelectorAll(
+        'tp-yt-paper-dialog, [aria-modal="true"]');
+    var best = null;
+    for (var i = 0; i < nodes.length; i++) {
+      var d = nodes[i];
+      var open = d.hasAttribute('opened') || d.opened === true ||
+        d.getAttribute('aria-modal') === 'true';
+      if (!open) continue;
+      var r = d.getBoundingClientRect();
+      if (r.width < 40 || r.height < 20) continue;
+      var cs = getComputedStyle(d);
+      if (cs.display === 'none' || cs.visibility === 'hidden' ||
+          cs.opacity === '0') continue;
+      best = d;
+    }
+    return best;
+  }
+
+  // Is el inside modal (also across shadow-root boundaries)?
+  function withinModal(modal, el) {
+    var node = el;
+    while (node) {
+      if (node === modal) return true;
+      node = parentOf(node);
+    }
+    return false;
+  }
+
+  // If a modal opened while a background item was highlighted, forget that
+  // item so OK cannot activate page content behind the dialog.
+  function clearIfOutsideModal() {
+    var modal = activeModal();
+    if (modal && current && !withinModal(modal, current)) {
+      current.removeAttribute('data-ytmb-focus');
+      current = null;
+    }
+  }
+
+  // Automatic dismissal of the "Open in the YouTube Music app" promo. On a TV
+  // it is a blocking modal with no way forward except "Not now".
+  function dismissAppPromo() {
+    var d = activeModal();
+    if (!d) return;
+    var text = d.innerText || '';
+    if (!/Open in the YouTube (Music )?app/i.test(text)) return;
+    var buttons = d.querySelectorAll('button');
+    for (var i = 0; i < buttons.length; i++) {
+      if (/not now|no thanks|later/i.test(buttons[i].innerText || '')) {
+        try { buttons[i].click(); } catch (e) {}
+        return;
+      }
+    }
+  }
+  setInterval(dismissAppPromo, 1200);
 
   function parentOf(el) {
     if (el.parentElement) return el.parentElement;
@@ -87,8 +163,38 @@ const String tvNavigationScript = r'''
     return roots;
   }
 
+  function collectWithin(root, out) {
+    var seen = typeof Set !== 'undefined' ? new Set() : null;
+    (function walk(r) {
+      try {
+        var found = r.querySelectorAll(SEL);
+        for (var j = 0; j < found.length; j++) {
+          var el = found[j];
+          if (seen) {
+            if (seen.has(el)) continue;
+            seen.add(el);
+          }
+          out.push(el);
+        }
+      } catch (e) {}
+      var all;
+      try { all = r.querySelectorAll('*'); } catch (e) { return; }
+      for (var i = 0; i < all.length; i++) {
+        var sr = all[i].shadowRoot;
+        if (sr) walk(sr);
+      }
+    })(root);
+  }
+
   var elemCache = null, elemCacheAt = 0;
   function allTargets() {
+    var modal = activeModal();
+    if (modal) {
+      // A modal owns the remote. Never focus page content behind its backdrop.
+      var inside = [];
+      collectWithin(modal, inside);
+      return inside;
+    }
     var now = Date.now();
     if (elemCache && now - elemCacheAt < 800) return elemCache;
     var roots = [document].concat(shadowRoots());
@@ -172,6 +278,7 @@ const String tvNavigationScript = r'''
   }
 
   function pick(dir) {
+    clearIfOutsideModal();
     var from = currentRect();
     var list = candidates();
     if (!list.length) return null;
@@ -238,6 +345,15 @@ const String tvNavigationScript = r'''
     var target = scrollTarget(current || deepActive());
     var amount = (target.clientHeight || window.innerHeight) * 0.6;
     target.scrollTop += dir === 'ArrowDown' ? amount : -amount;
+    if (current) {
+      // The old item may now be off-screen. Drop the highlight so the next
+      // press starts from what is actually visible instead of jumping back.
+      var r = current.getBoundingClientRect();
+      if (r.bottom <= 0 || r.top >= window.innerHeight) {
+        current.removeAttribute('data-ytmb-focus');
+        current = null;
+      }
+    }
   }
 
   function centerOf(el) {
@@ -319,6 +435,8 @@ const String tvNavigationScript = r'''
         return '';
       }
       var active = deepActive();
+      var modal = activeModal();
+      if (modal && active && !withinModal(modal, active)) active = null;
       if (isTextField(active)) {
         if (fieldText(active)) {
           submitField(active);
@@ -326,8 +444,15 @@ const String tvNavigationScript = r'''
         }
         return 'text';
       }
+      clearIfOutsideModal();
       var t = (current && current.isConnected) ? current : null;
-      if (!t) return '';
+      if (!t) {
+        // Nothing highlighted yet: start from the first visible item so the
+        // very first OK press is not a no-op.
+        t = pick('ArrowDown');
+        if (!t) return '';
+        setFocus(t);
+      }
       if (isTextField(t)) { t.focus(); return 'text'; }
       if (isPlayer(t) && v) {
         // OK = play/pause; OK twice quickly = fullscreen.
@@ -377,6 +502,8 @@ const String tvNavigationScript = r'''
     }
 
     var active = deepActive();
+    var modal = activeModal();
+    if (modal && active && !withinModal(modal, active)) active = null;
     if (isTextField(active)) {
       // Let the field handle typing, caret keys and the IME's arrow keys.
       if (k === 'Enter') {
@@ -415,7 +542,22 @@ const String tvNavigationScript = r'''
   // Keep the highlight in sync when the user (or the site) moves focus.
   document.addEventListener('focusin', function (e) {
     var t = e.composedPath ? e.composedPath()[0] : e.target;
-    if (t && t !== document.body && t.setAttribute && t !== current) {
+    if (!t || t === document.body || !t.setAttribute) return;
+    var modal = activeModal();
+    if (modal && !withinModal(modal, t)) {
+      // Page content behind an open dialog must not take the highlight.
+      if (current) current.removeAttribute('data-ytmb-focus');
+      current = null;
+      return;
+    }
+    if (!looksInteractive(t)) {
+      // Dialogs and page containers sometimes take focus themselves. Do not
+      // paint a giant box around them; let the next arrow pick a real button.
+      if (current) current.removeAttribute('data-ytmb-focus');
+      current = null;
+      return;
+    }
+    if (t !== current) {
       if (current) current.removeAttribute('data-ytmb-focus');
       current = t;
       t.setAttribute('data-ytmb-focus', '');

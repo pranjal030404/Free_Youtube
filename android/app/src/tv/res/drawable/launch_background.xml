@@ -1,5 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- TV: black while the app starts (no white flash in a dark room). -->
+<!-- TV: dark with the logo from the first frame, so there is never a blank
+     screen while the app starts. -->
 <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
-    <item android:drawable="@android:color/black" />
+    <item android:drawable="@color/splash_background" />
+    <item
+        android:width="84dp"
+        android:height="60dp"
+        android:gravity="center"
+        android:drawable="@drawable/splash_icon" />
 </layer-list>

@@ -13,7 +13,12 @@ import 'settings/settings_store.dart';
 
 const MethodChannel _deviceChannel = MethodChannel('ytmb/device');
 
-typedef _DeviceInfo = ({bool isTv, int sdkInt, String? userAgent});
+typedef _DeviceInfo = ({
+  bool isTv,
+  int sdkInt,
+  String? userAgent,
+  bool hwVp9,
+});
 
 Future<_DeviceInfo> _loadDeviceInfo() async {
   try {
@@ -24,10 +29,11 @@ Future<_DeviceInfo> _loadDeviceInfo() async {
       isTv: info?['isTv'] == true,
       sdkInt: (info?['sdkInt'] as num?)?.toInt() ?? 0,
       userAgent: info?['userAgent'] as String?,
+      hwVp9: info?['hwVp9'] == true,
     );
   } catch (_) {
     // Not an Android TV / channel unavailable: keep phone defaults.
-    return (isTv: false, sdkInt: 0, userAgent: null);
+    return (isTv: false, sdkInt: 0, userAgent: null, hwVp9: false);
   }
 }
 
@@ -72,6 +78,7 @@ Future<void> main() async {
   final controller = BrowserController(
     settings: settings,
     isTv: isTv,
+    hwVp9: device.hwVp9,
     initialUserAgent: userAgent,
   );
 

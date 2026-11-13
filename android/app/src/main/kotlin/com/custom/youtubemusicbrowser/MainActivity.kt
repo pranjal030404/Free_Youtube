@@ -121,6 +121,26 @@ class MainActivity : FlutterActivity() {
             "Chrome/$version Mobile Safari/537.36"
     }
 
+    /**
+     * True when the device has a hardware VP9 decoder that takes at least
+     * 1080p in both orientations (portrait Shorts are 1080x1920). The page is
+     * only offered VP9 in that case; see codec_filter.dart.
+     */
+    private fun hasHardwareVp9(): Boolean = try {
+        android.media.MediaCodecList(android.media.MediaCodecList.REGULAR_CODECS)
+            .codecInfos.any { info ->
+                if (info.isEncoder) return@any false
+                val software = if (Build.VERSION.SDK_INT >= 29) !info.isHardwareAccelerated
+                    else info.name.startsWith("OMX.google.") || info.name.startsWith("c2.android.")
+                if (software || "video/x-vnd.on2.vp9" !in info.supportedTypes) return@any false
+                val video = info.getCapabilitiesForType("video/x-vnd.on2.vp9").videoCapabilities
+                video != null && video.isSizeSupported(1920, 1080) &&
+                    video.supportedHeights.upper >= 1920
+            }
+    } catch (_: Exception) {
+        false
+    }
+
     /** Copies [src] to shared storage; returns a path to show the user. */
     private fun saveMedia(src: java.io.File, name: String, audio: Boolean, mime: String): String {
         val folder = (if (audio) android.os.Environment.DIRECTORY_MUSIC
@@ -164,6 +184,44 @@ class MainActivity : FlutterActivity() {
         return dest.absolutePath
     }
 
+    /** Joins a video-only and an audio-only file into one file, no re-encoding. */
+    private fun muxMedia(video: String, audio: String, out: String, webm: Boolean) {
+        val fmt = if (webm) android.media.MediaMuxer.OutputFormat.MUXER_OUTPUT_WEBM
+            else android.media.MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4
+        val muxer = android.media.MediaMuxer(out, fmt)
+        val extractors = ArrayList<android.media.MediaExtractor>()
+        try {
+            val map = ArrayList<Pair<android.media.MediaExtractor, Int>>()
+            for ((path, prefix) in listOf(video to "video/", audio to "audio/")) {
+                val ex = android.media.MediaExtractor().also { extractors.add(it) }
+                ex.setDataSource(path)
+                val track = (0 until ex.trackCount).firstOrNull {
+                    ex.getTrackFormat(it).getString(android.media.MediaFormat.KEY_MIME)
+                        ?.startsWith(prefix) == true
+                } ?: throw java.io.IOException("No $prefix track")
+                ex.selectTrack(track)
+                map.add(ex to muxer.addTrack(ex.getTrackFormat(track)))
+            }
+            muxer.start()
+            val buf = java.nio.ByteBuffer.allocate(4 shl 20)
+            val info = android.media.MediaCodec.BufferInfo()
+            for ((ex, idx) in map) {
+                while (true) {
+                    buf.clear()
+                    val n = ex.readSampleData(buf, 0)
+                    if (n < 0) break
+                    info.set(0, n, ex.sampleTime, ex.sampleFlags)
+                    muxer.writeSampleData(idx, buf, info)
+                    ex.advance()
+                }
+            }
+            muxer.stop()
+        } finally {
+            extractors.forEach { try { it.release() } catch (_: Exception) {} }
+            try { muxer.release() } catch (_: Exception) {}
+        }
+    }
+
     /** The videos and songs saved by [saveMedia]. */
     private fun listMedia(): List<Map<String, Any?>> {
         val out = ArrayList<Map<String, Any?>>()
@@ -179,7 +237,7 @@ class MainActivity : FlutterActivity() {
                     else android.os.Environment.DIRECTORY_MOVIES) + "/YT Lite/"
                 contentResolver.query(
                     collection,
-                    arrayOf(android.provider.MediaStore.MediaColumns._ID, android.provider.MediaStore.MediaColumns.DISPLAY_NAME, android.provider.MediaStore.MediaColumns.SIZE, android.provider.MediaStore.MediaColumns.DATE_ADDED, android.provider.MediaStore.MediaColumns.MIME_TYPE),
+                    arrayOf(android.provider.MediaStore.MediaColumns._ID, android.provider.MediaStore.MediaColumns.DISPLAY_NAME, android.provider.MediaStore.MediaColumns.SIZE, android.provider.MediaStore.MediaColumns.DATE_ADDED, android.provider.MediaStore.MediaColumns.MIME_TYPE, android.provider.MediaStore.MediaColumns.DURATION),
                     "${android.provider.MediaStore.MediaColumns.RELATIVE_PATH} = ? AND ${android.provider.MediaStore.MediaColumns.OWNER_PACKAGE_NAME} = ?",
                     arrayOf(folder, packageName), null,
                 )?.use { c ->
@@ -192,6 +250,7 @@ class MainActivity : FlutterActivity() {
                             "date" to c.getLong(3),
                             "mime" to (c.getString(4) ?: if (audio) "audio/*" else "video/*"),
                             "audio" to audio,
+                            "duration" to c.getLong(5),
                         ))
                     }
                 }
@@ -241,12 +300,31 @@ class MainActivity : FlutterActivity() {
                         "isTv" to isTelevision(),
                         "sdkInt" to Build.VERSION.SDK_INT,
                         "userAgent" to fastUserAgent(),
+                        "hwVp9" to hasHardwareVp9(),
                     )
                 )
                 // Give Android key focus back to Flutter so D-pad navigation
                 // works in routes drawn on top of the WebView (Settings).
                 // Moves a finished download from the app cache into the
                 // phone's shared Movies / Music folder.
+                "muxMedia" -> {
+                    val v = call.argument<String>("video")
+                    val a = call.argument<String>("audio")
+                    val o = call.argument<String>("out")
+                    val webm = call.argument<Boolean>("webm") ?: false
+                    if (v == null || a == null || o == null) {
+                        result.error("args", "path missing", null)
+                    } else {
+                        Thread {
+                            try {
+                                muxMedia(v, a, o, webm)
+                                runOnUiThread { result.success(null) }
+                            } catch (e: Exception) {
+                                runOnUiThread { result.error("mux", e.message, null) }
+                            }
+                        }.start()
+                    }
+                }
                 "saveMedia" -> {
                     val path = call.argument<String>("path")
                     val name = call.argument<String>("name") ?: "download"
@@ -298,6 +376,36 @@ class MainActivity : FlutterActivity() {
                         result.error("play", "No app found to play this file", null)
                     }
                 }
+                "thumb" -> {
+                    val uriStr = call.argument<String>("uri")
+                    Thread {
+                        try {
+                            val bmp = if (Build.VERSION.SDK_INT >= 29)
+                                contentResolver.loadThumbnail(
+                                    android.net.Uri.parse(uriStr),
+                                    android.util.Size(480, 270), null)
+                            else null
+                            if (bmp == null) {
+                                runOnUiThread { result.success(null) }
+                            } else {
+                                val bos = java.io.ByteArrayOutputStream()
+                                bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, bos)
+                                val bytes = bos.toByteArray()
+                                runOnUiThread { result.success(bytes) }
+                            }
+                        } catch (e: Exception) {
+                            runOnUiThread { result.success(null) }
+                        }
+                    }.start()
+                }
+                "storageInfo" -> {
+                    try {
+                        val st = android.os.StatFs(android.os.Environment.getExternalStorageDirectory().path)
+                        result.success(mapOf("total" to st.totalBytes, "free" to st.availableBytes))
+                    } catch (e: Exception) {
+                        result.success(null)
+                    }
+                }
                 "deleteMedia" -> {
                     try {
                         val uri = android.net.Uri.parse(call.argument<String>("uri"))
@@ -306,6 +414,28 @@ class MainActivity : FlutterActivity() {
                         result.success(null)
                     } catch (e: Exception) {
                         result.error("delete", e.message, null)
+                    }
+                }
+                // Voice search: the TV's own speech recogniser (its dialog
+                // listens through the remote's microphone).
+                "recognizeSpeech" -> {
+                    if (pendingSpeech != null) {
+                        result.error("busy", "Already listening", null)
+                    } else {
+                        val intent = Intent(android.speech.RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                            .putExtra(
+                                android.speech.RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                                android.speech.RecognizerIntent.LANGUAGE_MODEL_FREE_FORM,
+                            )
+                            .putExtra(android.speech.RecognizerIntent.EXTRA_PROMPT, "Search YouTube")
+                            .putExtra(android.speech.RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+                        try {
+                            pendingSpeech = result
+                            startActivityForResult(intent, SPEECH_REQUEST)
+                        } catch (_: Exception) {
+                            pendingSpeech = null
+                            result.error("unavailable", "Voice search is not available on this TV", null)
+                        }
                     }
                 }
                 "setPageHandlesRemote" -> {
@@ -359,12 +489,29 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    private var pendingSpeech: MethodChannel.Result? = null
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode == SPEECH_REQUEST) {
+            val said = if (resultCode == RESULT_OK) {
+                data?.getStringArrayListExtra(android.speech.RecognizerIntent.EXTRA_RESULTS)
+                    ?.firstOrNull()
+            } else {
+                null
+            }
+            pendingSpeech?.success(said)
+            pendingSpeech = null
+            return
+        }
+        super.onActivityResult(requestCode, resultCode, data)
+    }
+
     /**
      * TV remotes cannot always reach the on-screen toolbar while the WebView has
      * focus. The menu/settings keys open the app's Settings route instead.
      */
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+        if (pageOwnsRemote && event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
             when (event.keyCode) {
                 KeyEvent.KEYCODE_MENU,
                 KeyEvent.KEYCODE_SETTINGS,
@@ -372,7 +519,40 @@ class MainActivity : FlutterActivity() {
                     deviceChannel?.invokeMethod("openSettings", null)
                     return true
                 }
+                // The remote's search / microphone key, when the system
+                // passes it on to the app.
+                KeyEvent.KEYCODE_SEARCH,
+                KeyEvent.KEYCODE_VOICE_ASSIST -> {
+                    deviceChannel?.invokeMethod("voiceKey", null)
+                    return true
+                }
             }
+        }
+        // While the on-screen keyboard is open it owns the remote: let the
+        // system/IME move between keys and type instead of forwarding D-pad
+        // presses to the page.
+        if (pageOwnsRemote) {
+            val ime = imeVisible()
+            if (event.action == KeyEvent.ACTION_DOWN &&
+                event.keyCode == KeyEvent.KEYCODE_BACK && ime
+            ) {
+                // BACK closes the keyboard first, like every other TV app.
+                // Blur the field so the D-pad can leave it afterwards.
+                pageWebView()?.let { webView ->
+                    val imm = getSystemService(INPUT_METHOD_SERVICE)
+                        as android.view.inputmethod.InputMethodManager
+                    imm.hideSoftInputFromWindow(webView.windowToken, 0)
+                    webView.evaluateJavascript(
+                        "(function(){try{var e=document.activeElement;" +
+                            "while(e&&e.shadowRoot&&e.shadowRoot.activeElement)" +
+                            "e=e.shadowRoot.activeElement;" +
+                            "if(e&&e.blur)e.blur();}catch(x){}return '';})()",
+                        null,
+                    )
+                }
+                return true
+            }
+            if (ime) return super.dispatchKeyEvent(event)
         }
         // Deliver remote navigation keys straight to the page so it works even
         // when Flutter's view has taken Android focus back.
@@ -432,6 +612,17 @@ class MainActivity : FlutterActivity() {
         pageWebView()?.let { disablePullToRefresh(it) }
     }
 
+    /** True while an on-screen keyboard is accepting text for the WebView. */
+    private fun imeVisible(): Boolean {
+        return try {
+            val imm = getSystemService(INPUT_METHOD_SERVICE)
+                as android.view.inputmethod.InputMethodManager
+            imm.isAcceptingText
+        } catch (_: Exception) {
+            false
+        }
+    }
+
     /** Sends a real touch at a point given as a fraction of the WebView size. */
     private fun tapWebView(webView: WebView, nx: Float, ny: Float) {
         if (!webView.hasFocus()) webView.requestFocus()
@@ -463,6 +654,10 @@ class MainActivity : FlutterActivity() {
         KeyEvent.KEYCODE_DPAD_CENTER,
         KeyEvent.KEYCODE_ENTER -> true
         else -> false
+    }
+
+    companion object {
+        private const val SPEECH_REQUEST = 4711
     }
 
     override fun onDestroy() {

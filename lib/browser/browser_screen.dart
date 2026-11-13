@@ -5,6 +5,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
+import '../download/download_sheet.dart';
+import '../download/downloader.dart';
 import '../download/downloads_screen.dart';
 import '../settings/settings_screen.dart';
 import '../widgets/loading_indicator.dart';
@@ -30,11 +32,14 @@ class _BrowserScreenState extends State<BrowserScreen>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     c.addListener(_onChange);
+    c.downloadRequest.addListener(_onDownloadRequest);
+    c.openDownloads.addListener(_onOpenDownloads);
     if (c.isTv) {
       // The remote's menu/settings key is handled natively so it works even
       // while the WebView has Android input focus.
       _deviceChannel.setMethodCallHandler((call) async {
         if (call.method == 'openSettings') await _openSettings();
+        if (call.method == 'voiceKey') await c.onVoiceKey();
         return null;
       });
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -58,6 +63,8 @@ class _BrowserScreenState extends State<BrowserScreen>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     c.removeListener(_onChange);
+    c.downloadRequest.removeListener(_onDownloadRequest);
+    c.openDownloads.removeListener(_onOpenDownloads);
     if (c.isTv) _deviceChannel.setMethodCallHandler(null);
     super.dispose();
   }
@@ -97,6 +104,32 @@ class _BrowserScreenState extends State<BrowserScreen>
           action: SnackBarAction(label: 'MENU', onPressed: _openSettings),
         ),
       );
+  }
+
+  void _onOpenDownloads() {
+    if (!mounted) return;
+    Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => const DownloadsScreen()),
+    );
+  }
+
+  void _onDownloadRequest() {
+    final id = c.menuVideoId ?? c.videoId.value;
+    if (id == null || !mounted) return;
+    if (c.downloader.busy) {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          const SnackBar(content: Text('A download is already in progress')),
+        );
+      return;
+    }
+    showDownloadSheet(
+      context,
+      c.downloader,
+      id,
+      dark: c.pageDark.value ?? Theme.of(context).brightness == Brightness.dark,
+    );
   }
 
   void _onChange() {
@@ -147,7 +180,28 @@ class _BrowserScreenState extends State<BrowserScreen>
       },
       child: ListenableBuilder(
         listenable: c,
-        builder: (context, _) => Scaffold(
+        builder: (context, _) => ValueListenableBuilder<bool?>(
+          valueListenable: c.pageDark,
+          builder: (context, dark, child) {
+            if (c.isTv || dark == null) return child!;
+            // Status / navigation bars follow the page's own theme.
+            final bg = dark ? const Color(0xFF0F0F0F) : Colors.white;
+            return AnnotatedRegion<SystemUiOverlayStyle>(
+              value: SystemUiOverlayStyle(
+                statusBarColor: Colors.transparent,
+                systemNavigationBarColor: Colors.transparent,
+                statusBarIconBrightness: dark
+                    ? Brightness.light
+                    : Brightness.dark,
+                systemNavigationBarIconBrightness: dark
+                    ? Brightness.light
+                    : Brightness.dark,
+              ),
+              child: ColoredBox(color: bg, child: child),
+            );
+          },
+          child: Scaffold(
+            backgroundColor: c.isTv ? null : Colors.transparent,
           body: SafeArea(
             top: !c.isFullscreen,
             bottom: !c.isFullscreen,
@@ -165,8 +219,8 @@ class _BrowserScreenState extends State<BrowserScreen>
                             c.userScripts,
                           ),
                           onWebViewCreated: c.attach,
-                          shouldOverrideUrlLoading: (_, action) async =>
-                              c.decide(action),
+                          shouldOverrideUrlLoading: (_, action) =>
+                              c.decideAsync(action),
                           onCreateWindow: (_, action) =>
                               c.onCreateWindow(action),
                           onLoadStart: (_, url) => c.onLoadStart(url),
@@ -204,12 +258,11 @@ class _BrowserScreenState extends State<BrowserScreen>
                               progress: c.progressNotifier,
                             ),
                           ),
-                        if (!c.isFullscreen && !c.isTv)
-                          Positioned(
-                            right: 12,
-                            bottom: 76, // above the site's bottom tab bar
-                            child: _DownloadButton(c: c),
-                          ),
+                        // TV: the YouTube logo stays up until the first
+                        // screen is drawn, so no blank page or loading
+                        // state is ever visible.
+                        if (!c.isTv) _DownloadBar(c.downloader),
+                        if (c.isTv) _Splash(ready: c.pageReady),
                         if (c.errorMessage != null) _ErrorView(c: c),
                       ],
                     ),
@@ -219,119 +272,7 @@ class _BrowserScreenState extends State<BrowserScreen>
             ),
           ),
         ),
-      ),
-    );
-  }
-}
-
-/// Shown on watch / Shorts pages: saves the video or just its audio.
-class _DownloadButton extends StatelessWidget {
-  const _DownloadButton({required this.c});
-  final BrowserController c;
-
-  Future<void> _start(BuildContext context, String id, bool audioOnly) async {
-    final messenger = ScaffoldMessenger.of(context);
-    final navigator = Navigator.of(context);
-    void say(String text, {bool open = false}) => messenger
-      ..hideCurrentSnackBar()
-      ..showSnackBar(
-        SnackBar(
-          content: Text(text),
-          action: open
-              ? SnackBarAction(
-                  label: 'OPEN',
-                  onPressed: () => navigator.push(
-                    MaterialPageRoute(builder: (_) => const DownloadsScreen()),
-                  ),
-                )
-              : null,
         ),
-      );
-    say(audioOnly ? 'Downloading song…' : 'Downloading video…');
-    try {
-      final where = await c.downloader.download(id, audioOnly: audioOnly);
-      say('Saved to $where', open: true);
-    } catch (e) {
-      say('Download failed: $e');
-    }
-  }
-
-  void _choose(BuildContext context, String id) {
-    showModalBottomSheet<void>(
-      context: context,
-      showDragHandle: true,
-      builder: (sheet) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ListTile(
-              leading: const Icon(Icons.movie_outlined),
-              title: const Text('Download video'),
-              subtitle: const Text('MP4, 360p, with sound'),
-              onTap: () {
-                Navigator.of(sheet).pop();
-                _start(context, id, false);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.music_note_outlined),
-              title: const Text('Download song'),
-              subtitle: const Text('Audio only (M4A)'),
-              onTap: () {
-                Navigator.of(sheet).pop();
-                _start(context, id, true);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.video_library_outlined),
-              title: const Text('My downloads'),
-              onTap: () {
-                Navigator.of(sheet).pop();
-                Navigator.of(context).push(
-                  MaterialPageRoute(builder: (_) => const DownloadsScreen()),
-                );
-              },
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return ValueListenableBuilder<String?>(
-      valueListenable: c.videoId,
-      builder: (context, id, _) => ValueListenableBuilder<double?>(
-        valueListenable: c.downloader.progress,
-        builder: (context, progress, _) {
-          if (id == null && progress == null) return const SizedBox.shrink();
-          return FloatingActionButton.small(
-            heroTag: null,
-            tooltip: progress == null ? 'Download' : 'Downloading',
-            backgroundColor: const Color(0xE6272727),
-            foregroundColor: Colors.white,
-            onPressed: progress != null || id == null
-                ? null
-                : () => _choose(context, id),
-            child: progress == null
-                ? const Icon(Icons.download)
-                : Stack(
-                    alignment: Alignment.center,
-                    children: [
-                      CircularProgressIndicator(
-                        value: progress > 0 ? progress : null,
-                        strokeWidth: 3,
-                        color: Colors.white,
-                      ),
-                      Text(
-                        '${(progress * 100).round()}',
-                        style: const TextStyle(fontSize: 10),
-                      ),
-                    ],
-                  ),
-          );
-        },
       ),
     );
   }
@@ -370,6 +311,110 @@ class _ErrorView extends StatelessWidget {
             ),
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// Covers the WebView until the page has drawn its first screen, then fades out.
+class _Splash extends StatelessWidget {
+  const _Splash({required this.ready});
+  final ValueNotifier<bool> ready;
+
+  @override
+  Widget build(BuildContext context) {
+    return Positioned.fill(
+      child: ValueListenableBuilder<bool>(
+        valueListenable: ready,
+        builder: (context, isReady, _) => IgnorePointer(
+          ignoring: isReady,
+          child: AnimatedOpacity(
+            opacity: isReady ? 0 : 1,
+            duration: const Duration(milliseconds: 350),
+            curve: Curves.easeOut,
+            child: const ColoredBox(
+              color: Color(0xFF0F0F0F),
+              child: Center(child: _Logo()),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// The same red play button the launch window shows (see splash_icon.xml).
+class _Logo extends StatelessWidget {
+  const _Logo();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 84,
+      height: 60,
+      decoration: BoxDecoration(
+        color: const Color(0xFFFF0033),
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: const Icon(Icons.play_arrow, color: Colors.white, size: 44),
+    );
+  }
+}
+
+/// Progress of a running download, styled like YouTube's snackbar.
+class _DownloadBar extends StatelessWidget {
+  const _DownloadBar(this.d);
+  final Downloader d;
+
+  @override
+  Widget build(BuildContext context) {
+    return Positioned(
+      left: 8,
+      right: 8,
+      bottom: 64,
+      child: ValueListenableBuilder<double?>(
+        valueListenable: d.progress,
+        builder: (context, p, _) {
+          if (p == null) return const SizedBox.shrink();
+          return ValueListenableBuilder<String>(
+            valueListenable: d.status,
+            builder: (context, status, _) => Material(
+              color: const Color(0xFF333333),
+              borderRadius: BorderRadius.circular(8),
+              elevation: 6,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        const Icon(Icons.download, color: Colors.white, size: 20),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(
+                            status == 'Finishing'
+                                ? 'Finishing…'
+                                : 'Downloading… ${(p * 100).round()}%',
+                            style: const TextStyle(color: Colors.white, fontSize: 14),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    LinearProgressIndicator(
+                      value: status == 'Finishing' ? null : p,
+                      minHeight: 3,
+                      color: const Color(0xFF3EA6FF),
+                      backgroundColor: Colors.white24,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          );
+        },
       ),
     );
   }

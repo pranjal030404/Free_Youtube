@@ -49,3 +49,10 @@ app.*.map.json
 
 # Release binaries are published on GitHub Releases, not committed
 *.apk
+
+# Signing material and local config must never be committed
+*.jks
+*.keystore
+key.properties
+local.properties
+.env
